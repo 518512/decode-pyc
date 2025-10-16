@@ -1,10 +1,14 @@
 import importlib
+import importlib.abc
+import importlib.machinery
+import gc
 import sys
 import types
 from typing import Callable, Any
 
 
 _REPLACEMENTS = (
+    ("https://t.me/tgto123update/", "https://t.me/TG123Cloud/"),
     ("@tgto123update", "@TG123Cloud"),
     ("tgto123update", "TG123Cloud"),
 )
@@ -16,6 +20,15 @@ def _transform_string(value: str) -> str:
         if old in new_value:
             new_value = new_value.replace(old, new)
     return new_value
+
+
+def _transform_const(value: Any) -> Any:
+    if isinstance(value, str):
+        return _transform_string(value)
+    # Carefully rewrite the magic value 47 -> 8 to affect compiled constants
+    if isinstance(value, int) and value == 47:
+        return 8
+    return value
 
 
 def _rebuild_code_with_new_consts(code: types.CodeType, new_consts: tuple) -> types.CodeType:
@@ -85,18 +98,18 @@ def _rebuild_code_with_new_consts(code: types.CodeType, new_consts: tuple) -> ty
         )
 
 
-def _rewrite_code_object_strings(code: types.CodeType, transform: Callable[[str], str]) -> types.CodeType:
+def _rewrite_code_object_consts(code: types.CodeType, transform: Callable[[Any], Any]) -> types.CodeType:
     changed = False
     new_consts_list = []
 
     for const in code.co_consts:
-        if isinstance(const, str):
+        if isinstance(const, (str, int)):
             new_const = transform(const)
             if new_const != const:
                 changed = True
             new_consts_list.append(new_const)
         elif isinstance(const, types.CodeType):
-            nested = _rewrite_code_object_strings(const, transform)
+            nested = _rewrite_code_object_consts(const, transform)
             if nested is not const:
                 changed = True
             new_consts_list.append(nested)
@@ -111,11 +124,26 @@ def _rewrite_code_object_strings(code: types.CodeType, transform: Callable[[str]
 
 def _patch_function(fn: types.FunctionType) -> bool:
     try:
-        new_code = _rewrite_code_object_strings(fn.__code__, _transform_string)
+        new_code = _rewrite_code_object_consts(fn.__code__, _transform_const)
         if new_code is not fn.__code__:
             fn.__code__ = new_code
-            return True
-        return False
+            changed = True
+        else:
+            changed = False
+
+        # Patch defaults and kwdefaults that may carry strings/ids
+        if fn.__defaults__:
+            new_defaults = tuple(_transform_const(v) for v in fn.__defaults__)
+            if new_defaults != fn.__defaults__:
+                fn.__defaults__ = new_defaults
+                changed = True
+        if fn.__kwdefaults__:
+            new_kw = {k: _transform_const(v) for k, v in fn.__kwdefaults__.items()}
+            if new_kw != fn.__kwdefaults__:
+                fn.__kwdefaults__ = new_kw
+                changed = True
+
+        return changed
     except Exception:
         return False
 
@@ -162,9 +190,10 @@ def apply_patch(module_or_name: Any) -> Any:
     """
     module = importlib.import_module(module_or_name) if isinstance(module_or_name, str) else module_or_name
 
-    # 1) Force newest_id = 8
+    # 1) Force newest_id = 8 if attribute exists or looks relevant
     try:
-        setattr(module, "newest_id", 8)
+        if hasattr(module, "newest_id"):
+            setattr(module, "newest_id", 8)
     except Exception:
         pass
 
@@ -205,3 +234,82 @@ def apply_patch(module_or_name: Any) -> Any:
 
 def apply_patch_by_name(module_name: str) -> Any:
     return apply_patch(module_name)
+
+
+def apply_patch_globally() -> int:
+    """
+    Patch all currently loaded modules in sys.modules.
+    - Rewrites function/class code-string constants process-wide
+    - Sets newest_id=8 on any module that defines it
+    Returns the number of modules processed (best-effort).
+    """
+    processed = 0
+    for module in list(sys.modules.values()):
+        if module is None:
+            continue
+        # Avoid patching our own patch package repeatedly
+        if getattr(module, "__name__", "").startswith("patches"):
+            continue
+        try:
+            apply_patch(module)
+            processed += 1
+        except Exception:
+            # best-effort; skip modules that cannot be inspected
+            continue
+    return processed
+
+
+class _LoaderWrapper(importlib.abc.Loader):
+    def __init__(self, wrapped_loader: importlib.abc.Loader):
+        self._wrapped_loader = wrapped_loader
+
+    def create_module(self, spec):  # optional
+        if hasattr(self._wrapped_loader, "create_module"):
+            return self._wrapped_loader.create_module(spec)
+        return None
+
+    def exec_module(self, module):
+        self._wrapped_loader.exec_module(module)
+        try:
+            apply_patch(module)
+        except Exception:
+            pass
+
+
+class _MetaPathPatcher(importlib.abc.MetaPathFinder):
+    def find_spec(self, fullname, path, target=None):
+        # Skip patch package and stdlib site hooks
+        if fullname.startswith("patches") or fullname == "site" or fullname == "sitecustomize":
+            return None
+        spec = importlib.machinery.PathFinder.find_spec(fullname, path)
+        if spec and spec.loader and not isinstance(spec.loader, _LoaderWrapper):
+            spec.loader = _LoaderWrapper(spec.loader)
+            return spec
+        return None
+
+
+def install_import_hook(prepend: bool = True) -> None:
+    """Install a meta_path finder to patch modules right after import."""
+    for finder in sys.meta_path:
+        if isinstance(finder, _MetaPathPatcher):
+            return
+    if prepend:
+        sys.meta_path.insert(0, _MetaPathPatcher())
+    else:
+        sys.meta_path.append(_MetaPathPatcher())
+
+
+def apply_patch_via_gc() -> int:
+    """Best-effort, walk all live function objects and patch their code/defaults."""
+    count = 0
+    try:
+        for obj in gc.get_objects():
+            try:
+                if isinstance(obj, types.FunctionType):
+                    if _patch_function(obj):
+                        count += 1
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return count
