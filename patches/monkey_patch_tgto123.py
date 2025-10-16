@@ -4,11 +4,13 @@ import importlib.machinery
 import gc
 import sys
 import types
+import functools
 from typing import Callable, Any
 
 
 _REPLACEMENTS = (
     ("https://t.me/tgto123update/", "https://t.me/TG123Cloud/"),
+    ("https://t.me/tgto123update", "https://t.me/TG123Cloud"),
     ("@tgto123update", "@TG123Cloud"),
     ("tgto123update", "TG123Cloud"),
 )
@@ -229,6 +231,57 @@ def apply_patch(module_or_name: Any) -> Any:
         elif isinstance(obj, type):
             changed_total += _patch_class(obj)
 
+    # 4) Wrap module-level send_message to sanitize outbound text
+    def _wrap_callable_string_transform(func: Any) -> Any:
+        if not callable(func):
+            return func
+        if getattr(func, "__patched_tgto123__", False):
+            return func
+
+        def _transform_arg(v: Any) -> Any:
+            if isinstance(v, str):
+                return _transform_string(v)
+            return v
+
+        @functools.wraps(func)
+        def wrapper(*args, **kwargs):
+            new_args = tuple(_transform_arg(a) for a in args)
+            new_kwargs = {k: _transform_arg(v) for k, v in kwargs.items()}
+            return func(*new_args, **new_kwargs)
+
+        try:
+            wrapper.__name__ = getattr(func, "__name__", "send_message")
+        except Exception:
+            pass
+        setattr(wrapper, "__patched_tgto123__", True)
+        return wrapper
+
+    try:
+        if hasattr(module, "send_message"):
+            setattr(module, "send_message", _wrap_callable_string_transform(getattr(module, "send_message")))
+    except Exception:
+        pass
+
+    # 5) Wrap bot.send_message if present
+    try:
+        bot = getattr(module, "bot", None)
+        if bot is not None and hasattr(bot, "send_message"):
+            orig = getattr(bot, "send_message")
+            wrapped = _wrap_callable_string_transform(orig)
+            try:
+                setattr(bot, "send_message", wrapped)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # 6) Special-case: patch telebot library methods when this is the telebot module
+    try:
+        if getattr(module, "__name__", "") == "telebot":
+            _patch_telebot_module(module)
+    except Exception:
+        pass
+
     return module
 
 
@@ -256,6 +309,14 @@ def apply_patch_globally() -> int:
         except Exception:
             # best-effort; skip modules that cannot be inspected
             continue
+
+    # Also try patching telebot if available now
+    try:
+        tb = sys.modules.get("telebot")
+        if tb is not None:
+            _patch_telebot_module(tb)
+    except Exception:
+        pass
     return processed
 
 
@@ -269,9 +330,32 @@ class _LoaderWrapper(importlib.abc.Loader):
         return None
 
     def exec_module(self, module):
+        fullname = getattr(module, "__name__", None)
+        # If loader can provide code, fetch and exec our transformed code BEFORE execution
+        try:
+            get_code = getattr(self._wrapped_loader, "get_code", None)
+            if callable(get_code) and fullname:
+                code_obj = get_code(fullname)
+                if isinstance(code_obj, types.CodeType):
+                    transformed = _rewrite_code_object_consts(code_obj, _transform_const)
+                    exec(transformed, module.__dict__)
+                    # best-effort post-fix for anything created at runtime
+                    try:
+                        apply_patch(module)
+                    except Exception:
+                        pass
+                    return
+        except Exception:
+            # If anything fails, fall back to normal execution then patch
+            pass
+
+        # Fallback path: run original exec then patch
         self._wrapped_loader.exec_module(module)
         try:
             apply_patch(module)
+            # If telebot just loaded, patch its classes
+            if getattr(module, "__name__", "") == "telebot":
+                _patch_telebot_module(module)
         except Exception:
             pass
 
@@ -313,3 +397,36 @@ def apply_patch_via_gc() -> int:
     except Exception:
         pass
     return count
+
+
+def _patch_telebot_module(telebot_module: Any) -> bool:
+    """Patch TeleBot methods to sanitize outbound/inbound text & chat ids."""
+    try:
+        cls = getattr(telebot_module, "TeleBot", None)
+        if cls is None:
+            return False
+
+        def _wrap_method(name: str) -> bool:
+            meth = getattr(cls, name, None)
+            if not callable(meth) or getattr(meth, "__patched_tgto123__", False):
+                return False
+
+            @functools.wraps(meth)
+            def wrapper(self, *args, **kwargs):
+                new_args = tuple(_transform_const(a) if isinstance(a, str) else a for a in args)
+                new_kwargs = {k: (_transform_const(v) if isinstance(v, str) else v) for k, v in kwargs.items()}
+                return meth(self, *new_args, **new_kwargs)
+
+            setattr(wrapper, "__patched_tgto123__", True)
+            try:
+                setattr(cls, name, wrapper)
+                return True
+            except Exception:
+                return False
+
+        changed = False
+        changed |= _wrap_method("send_message")
+        changed |= _wrap_method("get_chat")
+        return changed
+    except Exception:
+        return False
